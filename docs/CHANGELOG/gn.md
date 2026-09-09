@@ -5,6 +5,26 @@
 
 Format mengikuti [Keep a Changelog](https://keepachangelog.com/).
 
+## [v2.2.0] - 2026-09-08
+
+### Added
+
+- **Hybrid Multi-Upstream Router (`gateway/server.ts`, `gateway/upstream-router.ts`)**:
+  - GN Gateway (`:4010`) kini menjadi single entry yang me-route request ke beberapa upstream sekaligus: **OMP Gateway (`:4000`)** dan **VansRouter (`:20128`)**.
+  - Routing bersifat catalog-driven: model di-resolve ke upstream yang mempublikasikan model tsb di `/v1/models`; model yang tidak dikenal jatuh ke default upstream (kompatibilitas ke belakang).
+  - Modul baru `gateway/upstream-router.ts`: `buildUpstreamUrl`, `parseModelIds` (OpenAI list / object map / array), `resolveUpstreamForModel`, `mergeModelResponses` (dedupe lintas-upstream), `collectCatalogs` (fetch paralel + TTL cache 30s).
+- **Unified `/v1/models` Aggregator (`gateway/server.ts`)**:
+  - Intercept `GET /v1/models` menggantikan proxy passthrough, menggabungkan catalog kedua upstream menjadi satu daftar OpenAI-style dengan header `X-GN-Upstreams` (jumlah upstream yang berhasil di-fetch).
+- **Upstream API Key Auto-Resolution (`gateway/upstream-router.ts`)**:
+  - Zero-config: key VansRouter dibaca langsung dari DB `~/.9router/db/data.sqlite` (tabel `apiKeys`, `isActive=1`).
+  - Override opsional via env var (`apiKeyEnv`) atau manual (`apiKey`) pada definisi `gateway.upstreams`; key hanya dikirim sebagai `Authorization: Bearer` ke upstream yang memilikinya.
+- **Multi-Upstream CLI Presentation (`commands/gateway.ts`)**:
+  - Banner `start` & `record` menampilkan daftar seluruh upstream beserta base URL; `status`/`/gn/health` merender daftar upstream lengkap.
+
+### Changed
+
+- `configs/gn/config.json` kini memuat seksi `gateway.upstreams` sebagai template (user config `~/.config/gn/config.json` menimpa/melebarkan daftar default).
+
 ## [v2.1.4] - 2026-09-01
 
 ### Fixed

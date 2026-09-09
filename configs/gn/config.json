@@ -14,6 +14,21 @@
 	},
 	"gateway": {
 		"enabled": true,
+		"upstreams": [
+			{
+				"name": "omp",
+				"host": "127.0.0.1",
+				"port": 4000,
+				"basePath": "/v1"
+			},
+			{
+				"name": "vansrouter",
+				"host": "127.0.0.1",
+				"port": 20128,
+				"basePath": "/api/v1",
+				"apiKeyEnv": "VANS_API_KEY"
+			}
+		],
 		"fallback": {
 			"enabled": true,
 			"trigger_statuses": [404, 410, 429],

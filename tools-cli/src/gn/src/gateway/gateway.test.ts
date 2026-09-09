@@ -398,6 +398,157 @@ describe("6. Master Gateway Server End-to-End Integration", () => {
 	});
 });
 
+describe("8. Hybrid Multi-Upstream Router (Issue #38)", () => {
+	let upstreamA: any;
+	let upstreamB: any;
+	let hybridGateway: any;
+	const portA = 4512;
+	const portB = 4513;
+	const gwPort = 4510;
+
+	beforeAll(async () => {
+		// Upstream A = OMP-like (gemini)
+		upstreamA = Bun.serve({
+			port: portA,
+			hostname: "127.0.0.1",
+			async fetch(req) {
+				const url = new URL(req.url);
+				if (url.pathname === "/v1/models") {
+					return new Response(
+						JSON.stringify({
+							object: "list",
+							data: [{ id: "google-antigravity/gemini-3.8-flash" }],
+						}),
+					);
+				}
+				if (url.pathname === "/v1/chat/completions") {
+					const body: any = await req.json();
+					return new Response(
+						JSON.stringify({
+							id: "a",
+							model: body.model,
+							choices: [{ message: { content: `A:${body.model}` } }],
+						}),
+					);
+				}
+				return new Response("nf", { status: 404 });
+			},
+		});
+
+		// Upstream B = VansRouter-like (deepseek / xiamoi)
+		upstreamB = Bun.serve({
+			port: portB,
+			hostname: "127.0.0.1",
+			async fetch(req) {
+				const url = new URL(req.url);
+				if (url.pathname === "/api/v1/models") {
+					return new Response(
+						JSON.stringify({
+							object: "list",
+							data: [
+								{ id: "deepseek/deepseek-v4-flash" },
+								{ id: "xiamoi/mimo-pro" },
+							],
+						}),
+					);
+				}
+				if (url.pathname === "/api/v1/chat/completions") {
+					const body: any = await req.json();
+					return new Response(
+						JSON.stringify({
+							id: "b",
+							model: body.model,
+							choices: [{ message: { content: `B:${body.model}` } }],
+						}),
+					);
+				}
+				return new Response("nf", { status: 404 });
+			},
+		});
+
+		hybridGateway = createGatewayServer({
+			port: gwPort,
+			targetHost: "127.0.0.1",
+			targetPort: portA, // legacy default = upstream A
+			cacheEnabled: false,
+			shieldEnabled: false,
+			mode: "live",
+			upstreams: [
+				{ name: "omp", host: "127.0.0.1", port: portA, basePath: "/v1" },
+				{
+					name: "vansrouter",
+					host: "127.0.0.1",
+					port: portB,
+					basePath: "/api/v1",
+				},
+			],
+		});
+		hybridGateway.start();
+	});
+
+	afterAll(() => {
+		hybridGateway?.stop();
+		upstreamA?.stop();
+		upstreamB?.stop();
+	});
+
+	test("GET /v1/models merges catalogs from both upstreams", async () => {
+		const res = await fetch(`http://127.0.0.1:${gwPort}/v1/models`);
+		expect(res.status).toBe(200);
+		const data: any = await res.json();
+		const ids = data.data.map((m: any) => m.id);
+		expect(ids).toContain("google-antigravity/gemini-3.8-flash");
+		expect(ids).toContain("deepseek/deepseek-v4-flash");
+		expect(ids).toContain("xiamoi/mimo-pro");
+		expect(res.headers.get("X-GN-Upstreams")).toBe("2");
+	});
+
+	test("POST routes gemini model to upstream A (OMP)", async () => {
+		const res = await fetch(`http://127.0.0.1:${gwPort}/v1/chat/completions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "google-antigravity/gemini-3.8-flash",
+				messages: [{ role: "user", content: "hi" }],
+			}),
+		});
+		const data: any = await res.json();
+		expect(data.model).toBe("google-antigravity/gemini-3.8-flash");
+		expect(data.choices[0].message.content).toBe(
+			"A:google-antigravity/gemini-3.8-flash",
+		);
+	});
+
+	test("POST routes deepseek model to upstream B (VansRouter)", async () => {
+		const res = await fetch(`http://127.0.0.1:${gwPort}/v1/chat/completions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "deepseek/deepseek-v4-flash",
+				messages: [{ role: "user", content: "hi" }],
+			}),
+		});
+		const data: any = await res.json();
+		expect(data.model).toBe("deepseek/deepseek-v4-flash");
+		expect(data.choices[0].message.content).toBe(
+			"B:deepseek/deepseek-v4-flash",
+		);
+	});
+
+	test("unknown model defaults to upstream A (OMP)", async () => {
+		const res = await fetch(`http://127.0.0.1:${gwPort}/v1/chat/completions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "mystery/model-xyz",
+				messages: [{ role: "user", content: "hi" }],
+			}),
+		});
+		const data: any = await res.json();
+		expect(data.choices[0].message.content).toBe("A:mystery/model-xyz");
+	});
+});
+
 describe("7. Access Log & Fallback Chain Analytics", () => {
 	const logFile = join(TEST_DIR, "test-access.jsonl");
 	let logManager: AccessLogManager;

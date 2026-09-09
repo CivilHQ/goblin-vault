@@ -23,12 +23,19 @@ import {
 	formatLiveLogLine,
 	type AccessLogFilter,
 } from "../gateway";
+import {
+	buildUpstreamUrl,
+	loadUpstreamsFromConfig,
+} from "../gateway/upstream-router";
+import { getUnifiedConfigPath } from "../gateway/rules";
+import { readFileSync } from "node:fs";
 
 /** Bentuk respons /gn/health dari gateway server. */
 interface GatewayHealthResponse {
 	version?: string;
 	port?: number;
 	target?: string;
+	upstreams?: { name: string; url: string }[];
 	uptime?: number;
 	mode?: string;
 	cacheEnabled?: boolean;
@@ -46,6 +53,27 @@ interface GatewayStatsResponse {
 	uptimeSeconds?: number;
 }
 
+/**
+ * Muat daftar upstream dari config unified (user ~/.config/gn/config.json
+ * atau vault config). Fallback ke default bawaan (OMP + VansRouter).
+ */
+function loadDisplayUpstreams(): { name: string; url: string }[] {
+	try {
+		const cfgPath = getUnifiedConfigPath();
+		const rawConfig = cfgPath ? JSON.parse(readFileSync(cfgPath, "utf-8")) : {};
+		const upstreams = loadUpstreamsFromConfig(rawConfig);
+		return upstreams.map((u) => ({
+			name: u.name,
+			url: `http://${u.host}:${u.port}${u.basePath}`,
+		}));
+	} catch {
+		return [
+			{ name: "omp", url: "http://127.0.0.1:4000/v1" },
+			{ name: "vansrouter", url: "http://127.0.0.1:20128/api/v1" },
+		];
+	}
+}
+
 function showGatewayHelp(): void {
 	printGnHeader("GATEWAY INTERCEPTOR MANUAL");
 	console.log("USAGE");
@@ -54,7 +82,7 @@ function showGatewayHelp(): void {
 	console.log("");
 	console.log("SUBCOMMANDS");
 	console.log(
-		"  start         \x1b[1;36m󰐌\x1b[0m Jalankan gateway interceptor (Port 4010 -> Upstream 4000)",
+		"  start         \x1b[1;36m󰐌\x1b[0m Jalankan hybrid gateway (4010 -> OMP 4000 + VansRouter 20128)",
 	);
 	console.log(
 		"  status        \x1b[1;36m󰋼\x1b[0m Cek status gateway instance aktif & latency",
@@ -155,14 +183,17 @@ export async function handleGatewayCommand(argv: string[]): Promise<number> {
 
 	switch (sub) {
 		case "start": {
-			printGnHeader(`GN GATEWAY INTERCEPTOR v2.0.2`);
+			printGnHeader(`GN GATEWAY HYBRID ROUTER v2.1.4`);
 			console.log(`  ${ANSI_BOLD}Configuration:${ANSI_RESET}`);
 			console.log(
 				`  • Listen Port    : ${ANSI_CYAN}http://127.0.0.1:${port}${ANSI_RESET}`,
 			);
-			console.log(
-				`  • Upstream Target: ${ANSI_CYAN}http://127.0.0.1:${targetPort}${ANSI_RESET}`,
-			);
+			const disp = loadDisplayUpstreams();
+			for (const d of disp) {
+				console.log(
+					`  • Upstream [${d.name}]: ${ANSI_CYAN}${d.url}${ANSI_RESET}`,
+				);
+			}
 			console.log(
 				`  • Prompt Caching : ${cacheEnabled ? ANSI_GREEN + "ENABLED (SHA-256 / 2h TTL)" : ANSI_GRAY + "DISABLED"}${ANSI_RESET}`,
 			);
@@ -170,7 +201,7 @@ export async function handleGatewayCommand(argv: string[]): Promise<number> {
 				`  • Privacy Shield : ${shieldEnabled ? ANSI_GREEN + "ENABLED" : ANSI_GRAY + "DISABLED"}${ANSI_RESET}`,
 			);
 			console.log(
-				`  • Mode           : ${ANSI_YELLOW}LIVE INTERCEPTOR${ANSI_RESET}`,
+				`  • Mode           : ${ANSI_YELLOW}HYBRID MULTI-UPSTREAM ROUTER${ANSI_RESET}`,
 			);
 			console.log("");
 			console.log(
@@ -208,9 +239,11 @@ export async function handleGatewayCommand(argv: string[]): Promise<number> {
 			console.log(
 				`  • Listen Port    : ${ANSI_CYAN}http://127.0.0.1:${port}${ANSI_RESET}`,
 			);
-			console.log(
-				`  • Upstream Target: ${ANSI_CYAN}http://127.0.0.1:${targetPort}${ANSI_RESET}`,
-			);
+			for (const d of loadDisplayUpstreams()) {
+				console.log(
+					`  • Upstream [${d.name}]: ${ANSI_CYAN}${d.url}${ANSI_RESET}`,
+				);
+			}
 			console.log(`  • Mode           : ${ANSI_YELLOW}RECORD${ANSI_RESET}\n`);
 
 			const server = createGatewayServer({
@@ -288,7 +321,23 @@ export async function handleGatewayCommand(argv: string[]): Promise<number> {
 					["Service Status", `${ANSI_GREEN}󰄬 ONLINE (200 OK)${ANSI_RESET}`],
 					["Version", data.version || "-"],
 					["Port", String(data.port || port)],
-					["Target Upstream", data.target || `http://127.0.0.1:${targetPort}`],
+					[
+						"Upstreams",
+						(data.upstreams && data.upstreams.length > 0
+							? data.upstreams
+							: [
+									{
+										name: "omp",
+										url: data.target || `http://127.0.0.1:${targetPort}`,
+									},
+								]
+						)
+							.map(
+								(u) =>
+									`${ANSI_CYAN}${u.name}${ANSI_RESET} ${ANSI_GRAY}${u.url}${ANSI_RESET}`,
+							)
+							.join("\n                    "),
+					],
 					["Uptime", `${data.uptime}s`],
 					["Mode", data.mode || "live"],
 					[

@@ -46,6 +46,31 @@ export interface GatewayServerConfig {
 	mockFixtureFile?: string;
 	shieldEnabled: boolean;
 	sanitizeLogsOnly: boolean;
+	/** Daftar upstream yang bisa di-route (multi-upstream hybrid router). */
+	upstreams?: UpstreamTarget[];
+}
+
+/**
+ * Definisi satu upstream backend.
+ * `basePath` memisahkan prefix vendor dari path request, mis. VansRouter
+ * menyajikan model di `/api/v1/...` sedangkan OMP di `/v1/...`.
+ */
+export interface UpstreamTarget {
+	name: string;
+	host: string;
+	port: number;
+	basePath: string;
+	/** API key langsung (mode manual). */
+	apiKey?: string;
+	/** Nama env var yang memuat API key (override di atas apiKey). */
+	apiKeyEnv?: string;
+}
+
+/** Hasil resolusi upstream untuk satu request berdasarkan model ID. */
+export interface ResolvedRoute {
+	upstream: UpstreamTarget;
+	url: string;
+	authHeaders: Record<string, string>;
 }
 
 export interface CacheEntryMetadata {

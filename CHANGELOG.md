@@ -14,6 +14,20 @@
 
 ---
 
+## [v0.6.0] - 2026-09-08
+
+### ⚡ gn v2.2.0 Hybrid Multi-Upstream Router (Issue #38)
+
+- **Single Entry Hybrid Gateway (`gateway/server.ts`, `gateway/upstream-router.ts`)**:
+  - `gn gw` (`:4010`) kini me-route request ke **OMP Gateway (`:4000`)** dan **VansRouter (`:20128`)** sekaligus, jadi source of truth tunggal bagi OpenCode/Hermes/agent lokal.
+  - Routing **catalog-driven**: model di-resolve ke upstream yang mempublikasikannya; yang tidak dikenal jatuh ke upstream default.
+  - Modul baru `upstream-router.ts`: URL mapping vendor basePath, parser catalog multi-format, dedupe merger, TTL catalog cache (30s).
+- **Unified `/v1/models` Aggregator**: intercept `GET /v1/models` dan menggabungkan catalog kedua upstream (header `X-GN-Upstreams`).
+- **Auto API Key dari DB VansRouter**: zero-config baca `~/.9router/db/data.sqlite`; override via `apiKeyEnv`/`apiKey` pada `gateway.upstreams`.
+- Detail: [`docs/CHANGELOG/gn.md`](docs/CHANGELOG/gn.md)
+
+---
+
 ## [v0.5.2] - 2026-08-31
 
 ### ⚡ ZF v2.0.0 Architecture Evolution & Tmux Controller

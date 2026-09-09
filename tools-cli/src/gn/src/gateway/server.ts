@@ -22,6 +22,7 @@ import {
 } from "./circuit-breaker";
 import {
 	DEFAULT_FALLBACK,
+	getUnifiedConfigPath,
 	loadGatewayRules,
 	loadPrivacyHeaders,
 } from "./rules";
@@ -29,6 +30,15 @@ import { FixtureManager } from "./replay";
 import { sanitizeText, normalizeUpstreamTools } from "./sanitizer";
 import { AccessLogManager, type FallbackHop } from "./access-log";
 import type { GatewayServerConfig, GatewayStats } from "./types";
+import {
+	buildUpstreamUrl,
+	collectCatalogs,
+	loadUpstreamsFromConfig,
+	mergeModelResponses,
+	resolveAuthHeaders,
+	resolveUpstreamForModel,
+} from "./upstream-router";
+import { readFileSync } from "node:fs";
 
 export function createGatewayServer(
 	customConfig: Partial<GatewayServerConfig> = {},
@@ -63,6 +73,129 @@ export function createGatewayServer(
 		config.fixturesDir ? config.fixturesDir : undefined,
 	);
 	const accessLog = new AccessLogManager();
+
+	// ── Multi-upstream hybrid router state (Issue #38) ─────────────
+	// Prioritas definisi upstream:
+	//   1. customConfig.upstreams (dipakai test / embedding)
+	//   2. Legacy single-upstream: targetHost/targetPort customConfig dipakai
+	//      sebagai upstream "omp" (hindari tabrakan dgn OMP asli saat test)
+	//   3. Config unified user (~/.config/gn/config.json), default OMP+Vans
+	let upstreams: ReturnType<typeof loadUpstreamsFromConfig> = [];
+	const defaultName = "omp";
+	if (customConfig.upstreams && customConfig.upstreams.length > 0) {
+		upstreams = [...customConfig.upstreams];
+	} else if (customConfig.targetPort && customConfig.targetPort !== 4000) {
+		upstreams = [
+			{
+				name: defaultName,
+				host: customConfig.targetHost || "127.0.0.1",
+				port: customConfig.targetPort,
+				basePath: "/v1",
+			},
+			{
+				name: "vansrouter",
+				host: "127.0.0.1",
+				port: 20128,
+				basePath: "/api/v1",
+			},
+		];
+	} else {
+		try {
+			const cfgPath = getUnifiedConfigPath();
+			const rawConfig = cfgPath
+				? JSON.parse(readFileSync(cfgPath, "utf-8"))
+				: {};
+			upstreams = loadUpstreamsFromConfig(rawConfig);
+		} catch {
+			upstreams = loadUpstreamsFromConfig({});
+		}
+	}
+	// Pastikan upstream default (omp) selalu ada sebagai fallback route.
+	if (!upstreams.some((u) => u.name === defaultName)) {
+		upstreams = [
+			...upstreams,
+			{
+				name: defaultName,
+				host: "127.0.0.1",
+				port: config.targetPort,
+				basePath: "/v1",
+			},
+		];
+	}
+
+	const CATALOG_TTL_MS = 30_000; // Refresh catalog tiap 30 detik max
+	let catalogCache: Map<string, Set<string>> = new Map();
+	let lastCatalogFetch = 0;
+	let catalogFetchPromise: Promise<Map<string, Set<string>>> | null = null;
+
+	// Auth headers di-memoize per upstream (jarang berubah; buka DB Vans mahal).
+	const authHeaderCache = new Map<
+		string,
+		{ headers: Record<string, string>; at: number }
+	>();
+	const AUTH_CACHE_TTL_MS = 5 * 60_000;
+
+	async function getAuthHeadersFor(
+		upstream: (typeof upstreams)[number],
+	): Promise<Record<string, string>> {
+		const cached = authHeaderCache.get(upstream.name);
+		if (cached && Date.now() - cached.at < AUTH_CACHE_TTL_MS) {
+			return cached.headers;
+		}
+		const headers = await resolveAuthHeaders(upstream);
+		authHeaderCache.set(upstream.name, { headers, at: Date.now() });
+		return headers;
+	}
+
+	async function getCatalog(): Promise<Map<string, Set<string>>> {
+		const now = Date.now();
+		if (catalogFetchPromise) return catalogFetchPromise;
+		if (now - lastCatalogFetch < CATALOG_TTL_MS) return catalogCache;
+
+		catalogFetchPromise = collectCatalogs(upstreams)
+			.then((map) => {
+				catalogCache = map;
+				lastCatalogFetch = Date.now();
+				return map;
+			})
+			.catch(() => catalogCache) // Jangan biarkan catalog error merusak request
+			.finally(() => {
+				catalogFetchPromise = null;
+			});
+		return catalogFetchPromise;
+	}
+
+	async function resolveRouteForRequest(
+		reqPath: string,
+		search: string,
+		modelId: string | null,
+	): Promise<{
+		upstream: (typeof upstreams)[number];
+		url: string;
+		authHeaders: Record<string, string>;
+	}> {
+		// Coba resolve via catalog dulu (best-effort, jangan block request lama).
+		let target = upstreams.find((u) => u.name === defaultName) ?? upstreams[0];
+		try {
+			const catalog = await getCatalog();
+			target = resolveUpstreamForModel(
+				upstreams,
+				catalog,
+				modelId,
+				defaultName,
+			);
+		} catch {
+			// Default fallback bila catalog gagal
+		}
+		const authHeaders = await getAuthHeadersFor(target);
+		return {
+			upstream: target,
+			url: buildUpstreamUrl(target, reqPath, search),
+			authHeaders,
+		};
+	}
+
+	// ── End multi-upstream state ────────────────────────────────────
 
 	const stats: GatewayStats = {
 		uptimeSeconds: 0,
@@ -205,6 +338,10 @@ export function createGatewayServer(
 								version: GN_VERSION,
 								port: config.port,
 								target: `http://${config.targetHost}:${config.targetPort}`,
+								upstreams: upstreams.map((u) => ({
+									name: u.name,
+									url: `http://${u.host}:${u.port}${u.basePath}`,
+								})),
 								uptime: Math.floor((Date.now() - startTime) / 1000),
 								mode: config.mode,
 								cacheEnabled: config.cacheEnabled,
@@ -236,7 +373,45 @@ export function createGatewayServer(
 						if (mocked) return mocked;
 					}
 
-					const targetUrl = `http://${config.targetHost}:${config.targetPort}${url.pathname}${url.search}`;
+					// ── Unified /v1/models aggregator (Issue #38) ──────────
+					// Intercept & merge catalog dari semua upstream sekaligus,
+					// bukan proxy passthrough ke upstream tunggal.
+					if (
+						method === "GET" &&
+						(url.pathname === "/v1/models" || url.pathname.endsWith("/models"))
+					) {
+						const routes = await Promise.all(
+							upstreams.map(async (u) => {
+								const authHeaders = await getAuthHeadersFor(u);
+								const target = buildUpstreamUrl(u, "/v1/models", url.search);
+								return { u, authHeaders, target };
+							}),
+						);
+						const responses = await Promise.all(
+							routes.map(async (r) => {
+								try {
+									const res = await fetch(r.target, {
+										headers: { ...r.authHeaders, accept: "application/json" },
+										signal: AbortSignal.timeout(5000),
+									});
+									if (!res.ok)
+										return { upstreamName: r.u.name, bodyText: null };
+									return { upstreamName: r.u.name, bodyText: await res.text() };
+								} catch {
+									return { upstreamName: r.u.name, bodyText: null };
+								}
+							}),
+						);
+						const merged = mergeModelResponses(responses);
+						return new Response(JSON.stringify(merged), {
+							status: 200,
+							headers: {
+								"content-type": "application/json",
+								"X-GN-Upstreams": merged.upstreamCount.toString(),
+							},
+						});
+					}
+
 					const noCacheHeader =
 						req.headers.get("x-gn-no-cache") ||
 						req.headers.get("X-GN-No-Cache");
@@ -273,15 +448,6 @@ export function createGatewayServer(
 					const initialModel = primaryModel ?? "unknown";
 					const isStreamReq = parsedBodyInfo?.parsed?.stream === true;
 					const fallbackChain: FallbackHop[] = [];
-
-					// Upstream tool schema normalization (e.g. CommandCode Anthropic tools)
-					if (isLlmEndpoint && finalReqBody) {
-						finalReqBody = normalizeUpstreamTools(
-							finalReqBody,
-							targetUrl,
-							initialModel,
-						);
-					}
 
 					// Caching check
 					let promptHash = "";
@@ -336,6 +502,28 @@ export function createGatewayServer(
 						} else {
 							stats.cacheMisses++;
 						}
+					}
+
+					// Resolve upstream tujuan berdasarkan model (multi-upstream router).
+					// Dipanggil setelah cache-check supaya request yang cache-hit tidak
+					// menanggung biaya fetch catalog / buka DB Vans.
+					const route = await resolveRouteForRequest(
+						url.pathname,
+						url.search,
+						primaryModel,
+					);
+					const targetUrl = route.url;
+					for (const [h, v] of Object.entries(route.authHeaders)) {
+						outboundHeaders.set(h, v);
+					}
+
+					// Upstream tool schema normalization (e.g. CommandCode Anthropic tools)
+					if (isLlmEndpoint && finalReqBody) {
+						finalReqBody = normalizeUpstreamTools(
+							finalReqBody,
+							targetUrl,
+							initialModel,
+						);
 					}
 
 					// Upstream forwarder with abort propagation & TTFB timeout (15s)
@@ -498,7 +686,9 @@ export function createGatewayServer(
 						const isMessagesReq = url.pathname.includes("/messages");
 						const isStreamingResponse =
 							(contentType.includes("text/event-stream") || isStreamReq) &&
-							(!isMessagesReq || isStreamReq || contentType.includes("text/event-stream"));
+							(!isMessagesReq ||
+								isStreamReq ||
+								contentType.includes("text/event-stream"));
 
 						if (isStreamingResponse && upstreamResp.body) {
 							stats.activeStreams++;

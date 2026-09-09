@@ -4,6 +4,17 @@
 # Di-install via scripts/install-hooks.sh (symlink ke .git/hooks).
 set -euo pipefail
 
+# Ensure Go toolchain is in PATH
+if [[ -d "$HOME/.go/bin" ]]; then
+  export PATH="$HOME/.go/bin:$PATH"
+fi
+if command -v go >/dev/null 2>&1; then
+  GOPATH_BIN="$(go env GOPATH 2>/dev/null || true)/bin"
+  if [[ -n "$GOPATH_BIN" && -d "$GOPATH_BIN" ]]; then
+    export PATH="$PATH:$GOPATH_BIN"
+  fi
+fi
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 echo "🩺 goblin pre-push: running doctor (blocking)..."
